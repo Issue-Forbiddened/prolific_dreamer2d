@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from diffusers.models.attention_processor import (
     AttnAddedKVProcessor,
     AttnAddedKVProcessor2_0,
-    LoRAAttnAddedKVProcessor,
+    # LoRAAttnAddedKVProcessor,
     LoRAAttnProcessor,
     SlicedAttnAddedKVProcessor,
 )
@@ -255,7 +255,10 @@ def sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings, t, unet_p
         noise_pred_phi = noise
     elif generation_mode == 'vsd':
         with torch.no_grad():
-            noise_pred_phi = predict_noise0_diffuser(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, lora_v=lora_v, half_inference=half_inference)
+            if not multisteps > 1:
+                noise_pred_phi = predict_noise0_diffuser(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, lora_v=lora_v, half_inference=half_inference)
+            else:
+                noise_pred_phi = predict_noise0_diffuser_multistep(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, steps=multisteps, eta=0., half_inference=half_inference)
         # VSD
         grad = grad_scale * (noise_pred - noise_pred_phi.detach())
 
@@ -297,7 +300,8 @@ def extract_lora_diffusers(unet, device):
             hidden_size = unet.config.block_out_channels[block_id]
 
         if isinstance(attn_processor, (AttnAddedKVProcessor, SlicedAttnAddedKVProcessor, AttnAddedKVProcessor2_0)):
-            lora_attn_processor_class = LoRAAttnAddedKVProcessor
+            # lora_attn_processor_class = LoRAAttnAddedKVProcessor
+            raise NotImplementedError
         else:
             lora_attn_processor_class = LoRAAttnProcessor
 

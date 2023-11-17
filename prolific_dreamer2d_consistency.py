@@ -34,7 +34,7 @@ transformers_logging.set_verbosity_error()  # disable warning
 
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers import DDIMScheduler
-from diffusers import ConsistencyModelPipeline
+from diffusers import LCMScheduler, AutoPipelineForText2Image
 
 IMG_EXTENSIONS = ['jpg', 'png', 'jpeg', 'bmp']
 
@@ -160,15 +160,32 @@ def main():
     #######################################################################################
     ### load model
     logger.info(f'load models from path: {args.model_path}')
-    # 1. Load the autoencoder model which will be used to decode the latents into image space. 
-    vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae", torch_dtype=dtype)
-    # 2. Load the tokenizer and text encoder to tokenize and encode the text. 
-    tokenizer = CLIPTokenizer.from_pretrained(args.model_path, subfolder="tokenizer", torch_dtype=dtype)
-    text_encoder = CLIPTextModel.from_pretrained(args.model_path, subfolder="text_encoder", torch_dtype=dtype)
-    # 3. The UNet model for generating the latents.
-    unet = UNet2DConditionModel.from_pretrained(args.model_path, subfolder="unet", torch_dtype=dtype)
-    # 4. Scheduler
-    scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler", torch_dtype=dtype)
+
+    # # 1. Load the autoencoder model which will be used to decode the latents into image space. 
+    # vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae", torch_dtype=dtype)
+    # # 2. Load the tokenizer and text encoder to tokenize and encode the text. 
+    # tokenizer = CLIPTokenizer.from_pretrained(args.model_path, subfolder="tokenizer", torch_dtype=dtype)
+    # text_encoder = CLIPTextModel.from_pretrained(args.model_path, subfolder="text_encoder", torch_dtype=dtype)
+    # # 3. The UNet model for generating the latents.
+    # unet = UNet2DConditionModel.from_pretrained(args.model_path, subfolder="unet", torch_dtype=dtype)
+    # # 4. Scheduler
+    # scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler", torch_dtype=dtype)
+
+    adapter_id = "latent-consistency/lcm-lora-sdv1-5"
+    pipe = AutoPipelineForText2Image.from_pretrained(args.model_path,torch_dtype=dtype)
+    # pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler", torch_dtype=dtype)
+    pipe.to("cuda")
+    pipe.load_lora_weights(adapter_id)
+    pipe.fuse_lora()
+
+
+    unet=pipe.unet
+    vae=pipe.vae
+    text_encoder=pipe.text_encoder
+    tokenizer=pipe.tokenizer
+    scheduler=pipe.scheduler
+
 
     if args.half_inference:
         unet = unet.half()
@@ -188,7 +205,6 @@ def main():
     if args.generation_mode == 'vsd':
         if args.phi_model == 'lora':
             if args.lora_vprediction:
-                # assert args.model_path == 'stabilityai/stable-diffusion-2-1-base'
                 vae_phi = AutoencoderKL.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder="vae", torch_dtype=dtype).to(device)
                 unet_phi = UNet2DConditionModel.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder="unet", torch_dtype=dtype).to(device)
                 vae_phi.requires_grad_(False)
@@ -416,6 +432,7 @@ def main():
             if args.generation_mode == 'vsd':
                 ## update the unet (phi) model 
                 for _ in range(args.phi_update_step):
+                    
                     phi_optimizer.zero_grad()
                     if args.use_t_phi:
                         # different t for phi finetuning
@@ -464,7 +481,7 @@ def main():
                             if args.half_inference:
                                 pred_latents_phi = pred_latents_phi.half()
                             image_x0_phi = vae_phi.decode(pred_latents_phi / vae.config.scaling_factor).sample.to(torch.float32)
-                            image = torch.cat((image_,image_x0,image_x0_phi), dim=2) #latentd对应的图片,原始unet加噪去噪的图片,微调后的unet加噪去噪的图片
+                            image = torch.cat((image_,image_x0,image_x0_phi), dim=2) #latent对应的图片,原始unet加噪去噪的图片,微调后的unet加噪去噪的图片
                         else:
                             image = torch.cat((image_,image_x0), dim=2)
                     else:
