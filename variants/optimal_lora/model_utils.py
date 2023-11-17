@@ -1,14 +1,14 @@
 import torch
 from torch import nn
+from torch.cuda.amp import custom_bwd, custom_fwd
 import numpy as np
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
 
 from diffusers.models.attention_processor import (
     AttnAddedKVProcessor,
     AttnAddedKVProcessor2_0,
-    # LoRAAttnAddedKVProcessor,
+    LoRAAttnAddedKVProcessor,
     LoRAAttnProcessor,
     SlicedAttnAddedKVProcessor,
 )
@@ -234,10 +234,36 @@ def predict_noise0_diffuser_multistep(unet, noisy_latents, text_embeddings, t, g
     # return out["pred_xstart"]
 
 
+def optimal_noise(noisy_latents, particles, t, scheduler):
+    alpha = torch.sqrt(scheduler.alphas_cumprod[t])
+    sigma = torch.sqrt(1 - alpha ** 2)
+    sigma_2 = 1 - alpha ** 2
+    
+    def gauss_norm(z, xi):
+        # much faster when pixels are *uncorelated*
+        gauss =  torch.exp( -(z - alpha * xi)**2 / (2 * sigma_2) ) / ( sigma * torch.sqrt(torch.tensor(2*torch.pi)) )
+        log_gauss = torch.log(gauss)
+        log_gauss_pdf = log_gauss.sum(dim=list(range(1, len(log_gauss.shape))))
+        return log_gauss_pdf
+
+    log_gauss_pdf_list = []
+    for i in range(particles.shape[0]):
+        log_gauss_pdf_list.append(gauss_norm(noisy_latents, particles[i]))
+    log_gauss_pdfs = torch.stack(log_gauss_pdf_list, dim=0).T
+    # max_values, indices = torch.max(log_gauss_pdfs, dim=1)
+    # # eliminate self influence
+    # for i in range(indices.shape[0]):
+    #     log_gauss_pdfs[i, indices[i]] = -torch.inf
+    post_softmax = torch.nn.functional.softmax(log_gauss_pdfs, dim=1)
+    post_softmax = torch.nan_to_num(post_softmax, nan=0.0)
+    weighted_softmax = alpha * torch.einsum('bc,cijk->bijk', post_softmax, particles)
+    return - 1 / sigma * (weighted_softmax - noisy_latents)
+
+
 def sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings, t, unet_phi=None, guidance_scale=7.5, \
                         grad_scale=1, cfg_phi=1., generation_mode='sds', phi_model='lora', \
                             cross_attention_kwargs={}, multisteps=1, scheduler=None, lora_v=False, \
-                                half_inference = False):
+                                half_inference = False, particles=None):
     # ref to https://github.com/ashawkey/stable-dreamfusion/blob/main/guidance/sd_utils.py#L114
     unet_cross_attention_kwargs = {'scale': 0} if (generation_mode == 'vsd' and phi_model == 'lora' and not lora_v) else {}
     with torch.no_grad():
@@ -254,11 +280,13 @@ def sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings, t, unet_p
         # grad = grad_scale * (noise_pred)  # SJC
         noise_pred_phi = noise
     elif generation_mode == 'vsd':
-        with torch.no_grad():
-            if not multisteps > 1:
-                noise_pred_phi = predict_noise0_diffuser(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, lora_v=lora_v, half_inference=half_inference)
-            else:
-                noise_pred_phi = predict_noise0_diffuser_multistep(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, steps=multisteps, eta=0., half_inference=half_inference)
+        if phi_model != 'optimal':
+            with torch.no_grad():
+                noise_pred_phi = predict_noise0_diffuser(unet_phi, noisy_latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, lora_v=lora_v)
+        elif particles is not None:
+            noise_pred_phi = optimal_noise(noisy_latents.detach(), particles.detach(), t, scheduler)
+        else:
+            noise_pred_phi = noise
         # VSD
         grad = grad_scale * (noise_pred - noise_pred_phi.detach())
 
@@ -267,12 +295,12 @@ def sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings, t, unet_p
     ## return grad
     return grad, noise_pred.detach().clone(), noise_pred_phi.detach().clone()
 
-def phi_vsd_grad_diffuser(unet_phi, latents, noise, text_embeddings, t, cfg_phi=1., grad_scale=1, cross_attention_kwargs={}, scheduler=None, lora_v=False, half_inference=False):
+def phi_vsd_grad_diffuser(unet_phi, latents, noise, text_embeddings, t, cfg_phi=1., grad_scale=1, cross_attention_kwargs={}, scheduler=None, lora_v=False):
     loss_fn = nn.MSELoss()
     # ref to https://github.com/ashawkey/stable-dreamfusion/blob/main/guidance/sd_utils.py#L114
     # predict the noise residual with unet
     clean_latents = scheduler.step(noise, t, latents).pred_original_sample
-    noise_pred = predict_noise0_diffuser(unet_phi, latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler, half_inference=half_inference)
+    noise_pred = predict_noise0_diffuser(unet_phi, latents, text_embeddings, t, guidance_scale=cfg_phi, cross_attention_kwargs=cross_attention_kwargs, scheduler=scheduler)
     if lora_v:
         target = scheduler.get_velocity(clean_latents.detach(), noise, t)
     else:
@@ -300,8 +328,7 @@ def extract_lora_diffusers(unet, device):
             hidden_size = unet.config.block_out_channels[block_id]
 
         if isinstance(attn_processor, (AttnAddedKVProcessor, SlicedAttnAddedKVProcessor, AttnAddedKVProcessor2_0)):
-            # lora_attn_processor_class = LoRAAttnAddedKVProcessor
-            raise NotImplementedError
+            lora_attn_processor_class = LoRAAttnAddedKVProcessor
         else:
             lora_attn_processor_class = LoRAAttnProcessor
 
@@ -331,83 +358,6 @@ def update_curve(values, label, x_label, y_label, model_path, run_id, log_steps=
     ax.legend()
     plt.savefig(f'{model_path}/{label}_curve_{run_id}.png', dpi=600)
     plt.close()
-
-
-def get_optimizer(parameters, config):
-    if config.optimizer == "adam":
-        optimizer = torch.optim.Adam(parameters, lr=config.lr, betas=config.betas, \
-                                    weight_decay=config.weight_decay)
-    elif config.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(parameters, lr=config.lr, betas=config.betas, \
-                                    weight_decay=config.weight_decay)
-    elif config.optimizer == "radam":
-        optimizer = torch.optim.RAdam(parameters, lr=config.lr, betas=config.betas, \
-                                    weight_decay=config.weight_decay)
-    elif config.optimizer == "sgd":
-        optimizer = torch.optim.SGD(parameters, lr=config.lr, betas=config.betas, \
-                                    weight_decay=config.weight_decay)
-    else:
-        raise NotImplementedError(f"Optimizer {config.optimizer} not implemented.")
-    return optimizer
-
-
-def get_latents(particles, vae, rgb_as_latents=False, use_mlp_particle=False):
-    ### get latents from particles
-    if use_mlp_particle:
-        images = []
-        output_size = 64 if rgb_as_latents else 512
-        # Loop over all MLPs and generate an image for each
-        for particle_mlp in particles:
-            image = particle_mlp.generate_image(output_size)
-            images.append(image)
-        # Stack all images together
-        latents = torch.cat(images, dim=0)
-        if not rgb_as_latents:
-            latents = vae.config.scaling_factor * vae.encode(latents).latent_dist.sample()
-    else:
-        if rgb_as_latents:
-            latents = F.interpolate(particles, (64, 64), mode="bilinear", align_corners=False)
-        else:
-            rgb_BCHW_512 = F.interpolate(particles, (512, 512), mode="bilinear", align_corners=False)
-            # encode image into latents with vae
-            latents = vae.config.scaling_factor * vae.encode(rgb_BCHW_512).latent_dist.sample()
-    return latents
-
-
-@torch.no_grad()
-def batch_decode_vae(latents, vae):
-    latents = 1 / vae.config.scaling_factor * latents.clone().detach()
-    bs = 8  # avoid OOM for too many particles
-    images = []
-    for i in range(int(np.ceil(latents.shape[0] / bs))):
-        batch_i = latents[i*bs:(i+1)*bs]
-        image_i = vae.decode(batch_i).sample.to(torch.float32)
-        images.append(image_i)
-    image = torch.cat(images, dim=0)
-    return image
-
-
-@torch.no_grad()
-def get_images(particles, vae, rgb_as_latents=False, use_mlp_particle=False):
-    ### get images from particles
-    if use_mlp_particle:
-        images = []
-        output_size = 64 if rgb_as_latents else 512
-        # Loop over all MLPs and generate an image for each
-        for particle_mlp in particles:
-            image = particle_mlp.generate_image(output_size)
-            images.append(image)
-        # Stack all images together
-        images = torch.cat(images, dim=0)
-        if rgb_as_latents:
-            images = batch_decode_vae(images, vae)
-    else:
-        if rgb_as_latents:
-            latents = F.interpolate(particles, (64, 64), mode="bilinear", align_corners=False)
-            images = batch_decode_vae(latents, vae)
-        else:
-            images = F.interpolate(particles, (512, 512), mode="bilinear", align_corners=False)
-    return images
 
 
 ### siren from https://github.com/vsitzmann/siren/
@@ -456,9 +406,8 @@ class Siren(nn.Module):
         if outermost_linear:
             final_linear = nn.Linear(hidden_features, out_features)
             with torch.no_grad():
-                # final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0, 
-                #                               np.sqrt(6 / hidden_features) / hidden_omega_0)
-                final_linear.weight.normal_(0, 1 / hidden_features)
+                final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0, 
+                                              np.sqrt(6 / hidden_features) / hidden_omega_0)
             self.net.append(final_linear)
         else:
             self.net.append(SineLayer(hidden_features, out_features, 
